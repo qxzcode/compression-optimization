@@ -98,6 +98,9 @@ impl VariableRegistry {
 pub struct Model {
     pub symbols: Vec<Symbol>,
     symbols_by_label: HashMap<u8, Vec<usize>>,
+
+    start_arcs: HashMap<usize, BoolLiteral>,
+
     permutation_index_sets: Vec<Range<usize>>,
     eq_indicator_vars: Vec<(usize, LinearExpr)>,
     copy_span_starts: Vec<BoolLiteral>,
@@ -111,12 +114,14 @@ impl Model {
         let mut model = Model {
             symbols: Vec::new(),
             symbols_by_label: HashMap::new(),
+            start_arcs: HashMap::new(),
             permutation_index_sets: Vec::new(),
             eq_indicator_vars: Vec::new(),
             copy_span_starts: Vec::new(),
             vars: VariableRegistry::default(),
         };
-        model.create_symbols(&string_set, &[]);
+        let (start_arcs, _) = model.create_symbols(&string_set, &[]);
+        model.start_arcs = HashMap::from_iter(start_arcs);
         model.create_copy_flags();
         model.create_copy_span_starts();
         model
@@ -556,30 +561,40 @@ print("Status:", solver.status_name())
                 _ => panic!("unexpected boolean literal value: {}", value),
             })
         };
-        let get_successor = |id: usize| -> PyResult<Option<usize>> {
-            let symbol = &self.symbols[id];
-            let outgoing_arcs = &symbol.outgoing_arcs;
-            let mut successors = outgoing_arcs.iter().filter_map(|(&id, &condition)| {
-                get_literal_value(condition).unwrap().then_some(id)
-            });
-            let num_successors = successors.clone().count();
-            if num_successors == 0 {
-                Ok(None)
-            } else if num_successors == 1 {
-                Ok(Some(successors.next().unwrap()))
+        let get_successor = |outgoing_arcs: &HashMap<usize, BoolLiteral>, id: Option<usize>| {
+            let successors: Vec<usize> = outgoing_arcs
+                .iter()
+                .filter_map(|(&id, &cond)| {
+                    get_literal_value(cond)
+                        .map(|cond| cond.then_some(id))
+                        .transpose()
+                })
+                .collect::<PyResult<_>>()?;
+            if successors.is_empty() {
+                PyResult::Ok(None)
+            } else if successors.len() == 1 {
+                PyResult::Ok(Some(*successors.first().unwrap()))
             } else {
                 panic!(
-                    "solution has {num_successors} successors for symbol ID {id} ({:?})",
-                    char::from(symbol.label),
+                    "solution has {} successors for {}",
+                    successors.len(),
+                    match id {
+                        Some(id) => format!(
+                            "symbol ID {id:?} ({:?})",
+                            char::from(self.symbols[id].label),
+                        ),
+                        None => "<start>".into(),
+                    },
                 );
             }
         };
 
         let mut output_ids = Vec::new();
-        let mut next_id = Some(0); // TODO: properly get the first symbol from the solution.
+        let mut next_id = get_successor(&self.start_arcs, None)?;
+        assert!(next_id.is_some());
         while let Some(id) = next_id {
             output_ids.push(id);
-            next_id = get_successor(id)?;
+            next_id = get_successor(&self.symbols[id].outgoing_arcs, Some(id))?;
         }
 
         let mut highlighted = true;
