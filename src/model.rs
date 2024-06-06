@@ -381,7 +381,68 @@ impl Model {
                 }
             }
 
-            self.copy_span_starts.push(self.vars.literal(is_css));
+            let is_css = self.vars.literal(is_css);
+            self.copy_span_starts.push(is_css);
+
+            let match_bounds = symbol
+                .copy_flags
+                .iter()
+                .map(|(id2, &(copy_flag, is_before))| {
+                    let mut id1 = id;
+                    let mut id2 = *id2;
+                    let mut min_len: usize = 1;
+                    let mut max_len = usize::MAX;
+                    loop {
+                        let arcs1 = &self.symbols[id1].outgoing_arcs;
+                        let arcs2 = &self.symbols[id2].outgoing_arcs;
+                        if arcs1.len() == 1 && arcs2.len() == 1 {
+                            id1 = *arcs1.keys().next().unwrap();
+                            id2 = *arcs2.keys().next().unwrap();
+                            if self.symbols[id1].label == self.symbols[id2].label {
+                                min_len += 1;
+                                continue;
+                            } else {
+                                max_len = min_len;
+                                break;
+                            }
+                        }
+                        break;
+                    }
+
+                    (copy_flag, is_before, min_len, max_len)
+                })
+                .collect::<Vec<_>>();
+
+            if let Some(max_guaranteed_min_len) = match_bounds
+                .iter()
+                .filter(|(_, is_before, _, _)| *is_before == BeforeCondition::Always)
+                .map(|(_, _, min_len, _)| *min_len)
+                .max()
+            {
+                let len_upper_bound = match_bounds
+                    .iter()
+                    .map(|(_, _, _, max_len)| *max_len)
+                    .max()
+                    .unwrap();
+
+                let mut good_flags = Disjunction::Const(false);
+                if let Some((copy_flag, _, _, _)) =
+                    match_bounds.iter().find(|(_, is_before, min_len, _)| {
+                        *is_before == BeforeCondition::Always && *min_len == len_upper_bound
+                    })
+                {
+                    // We found a copy target that is guaranteed to obtain the maximum possible
+                    // match length, so we can mandate that this specific token be copied (if is_css).
+                    good_flags |= *copy_flag;
+                } else {
+                    for (copy_flag, _, _, max_len) in match_bounds {
+                        if max_len >= max_guaranteed_min_len {
+                            good_flags |= copy_flag;
+                        }
+                    }
+                }
+                self.vars.add_implication(is_css, good_flags);
+            }
         }
 
         println!("Created copy span start flags. ({total_num_literals} literals)");
@@ -537,6 +598,8 @@ model.minimize(sum(csss))
 # Solve
 global solver
 solver = cp_model.CpSolver()
+#print(solver.parameters.max_presolve_iterations); quit()
+#solver.parameters.max_presolve_iterations = 30
 solver.parameters.max_memory_in_mb = 1_000 // 2
 solver.parameters.log_search_progress = True
 # solver.parameters.max_time_in_seconds = 60.0 * 10
