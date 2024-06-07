@@ -13,6 +13,7 @@ fn solve() -> PyResult<Py<PyAny>> {
     use string_set::StringSet::*;
 
     let seq = Sequence(vec![
+        //*
         Literal("<g".as_bytes().to_vec()),
         Permutation(vec![
             Literal(" stroke-width=\"6\"".as_bytes().to_vec()),
@@ -27,7 +28,6 @@ fn solve() -> PyResult<Py<PyAny>> {
             Literal(" stroke-width=\"10\"".as_bytes().to_vec()),
         ]),
         Literal(">real content</g>".as_bytes().to_vec()),
-        /*
         Literal("<g".as_bytes().to_vec()),
         Permutation(vec![
             Literal(" fill=\"green\"".as_bytes().to_vec()),
@@ -66,6 +66,8 @@ fn solve() -> PyResult<Py<PyAny>> {
             .as_bytes()
             .to_vec(),
         ),
+        // */
+        //*
         Literal("<svg".as_bytes().to_vec()),
         Permutation(vec![
         Literal(" xmlns=\"http://www.w3.org/2000/svg\"".as_bytes().to_vec()),

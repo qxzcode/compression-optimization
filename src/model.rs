@@ -9,6 +9,7 @@ use std::{
 };
 
 use pyo3::prelude::*;
+use rand::seq::SliceRandom;
 
 use crate::{
     bool_literal::{BoolLiteral, Conjunction, Disjunction},
@@ -36,6 +37,7 @@ struct VariableRegistry {
     conjunction_vars: HashMap<BTreeMap<usize, bool>, usize>,
     disjunctions: HashSet<BTreeMap<usize, bool>>,
     is_less_literals: HashMap<(usize, usize), BoolLiteral>, // (id1, id2) => is_less  means  is_less = (id1 < id2)
+    at_least_one_ifs: Vec<(Vec<BoolLiteral>, Conjunction)>,
 }
 
 mod variable_registry_impl {
@@ -137,6 +139,15 @@ mod variable_registry_impl {
                     self.disjunctions.insert(BTreeMap::from_iter(vars));
                 }
             }
+        }
+
+        pub(super) fn add_at_least_one_if(
+            &mut self,
+            literals: impl IntoIterator<Item = BoolLiteral>,
+            condition: Conjunction,
+        ) {
+            self.at_least_one_ifs
+                .push((literals.into_iter().collect(), condition));
         }
     }
 }
@@ -399,14 +410,14 @@ impl Model {
 
 struct VarMap<'py> {
     py: Python<'py>,
-    map: HashMap<usize, Bound<'py, PyAny>>,
+    map: Vec<Bound<'py, PyAny>>,
 }
 
 impl<'py> Index<usize> for VarMap<'py> {
     type Output = Bound<'py, PyAny>;
 
     fn index(&self, id: usize) -> &Self::Output {
-        &self.map[&id]
+        &self.map[id]
     }
 }
 
@@ -456,8 +467,19 @@ impl<'py> VarMap<'py> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum HintType {
+    None,
+    Original,
+    Random,
+}
+
 impl Model {
-    fn to_cp_sat<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyAny>, VarMap<'py>)> {
+    fn to_cp_sat<'py>(
+        &self,
+        py: Python<'py>,
+        enforce_hints: HintType,
+    ) -> PyResult<(Bound<'py, PyAny>, VarMap<'py>)> {
         // Create the model object.
         let model = py
             .import_bound("ortools.sat.python.cp_model")?
@@ -465,23 +487,24 @@ impl Model {
             .call0()?;
 
         // Create the variables.
-        let mut vars = HashMap::new();
+        let mut vars = Vec::new();
         for (i, range) in self.vars.ranges.iter().enumerate() {
-            let var = model.getattr("new_int_var")?.call1((
-                *range.start(),
-                *range.end(),
-                format!("var{i}"),
-            ))?;
-            vars.insert(i, var);
+            vars.push(model.call_method1(
+                "new_int_var",
+                (*range.start(), *range.end(), format!("var{i}")),
+            )?);
         }
         let vars = VarMap { py, map: vars };
 
-        let enforce_hints = false;
-        if enforce_hints {
+        if enforce_hints != HintType::None {
             // Create the hint enforcement constraints.
             for index_set in &self.permutation_index_sets {
-                for (i, var_index) in index_set.clone().enumerate() {
-                    model.call_method1("add", (vars[var_index].call_method1("__eq__", (i,))?,))?;
+                let mut hints = Vec::from_iter(0..index_set.len());
+                if enforce_hints == HintType::Random {
+                    hints.shuffle(&mut rand::thread_rng());
+                }
+                for (var, value) in index_set.clone().zip(hints) {
+                    model.call_method1("add", (vars[var].call_method1("__eq__", (value,))?,))?;
                 }
             }
         }
@@ -540,6 +563,13 @@ impl Model {
                 .call_method1("only_enforce_if", (vars.literal(!*is_less)?,))?;
         }
 
+        // Create the (enforced) "at least one" constraints.
+        for (literals, condition) in &self.vars.at_least_one_ifs {
+            model
+                .call_method1("add_at_least_one", (vars.literals(literals)?,))?
+                .call_method1("only_enforce_if", (vars.literals(condition.literals())?,))?;
+        }
+
         let mut objective = 0i64.into_py(py).into_bound(py);
         for is_css in vars.literals(&self.copy_span_starts)? {
             objective = objective.add(is_css)?;
@@ -583,29 +613,98 @@ impl Solution {
 impl Model {
     pub fn solve<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         println!();
+        println!();
 
-        for iter_num in 1..=10 {
-            println!("====== Iteration {} ======", iter_num);
-            let (model, vars) = self.to_cp_sat(py)?;
+        let max_memory_in_mb = 1_000;
 
-            let solver = py
-                .import_bound("ortools.sat.python.cp_model")?
-                .getattr("CpSolver")?
-                .call0()?;
-            let parameters = solver.getattr("parameters")?;
-            // parameters.setattr("max_presolve_iterations", 30)?;
-            parameters.setattr("max_memory_in_mb", 1_000 / 2)?;
-            // parameters.setattr("log_search_progress", true)?;
-            // parameters.setattr("max_time_in_seconds", 60.0 * 10.0)?;
-            // parameters.setattr("debug_crash_on_bad_hint", true)?;
+        let solver = py
+            .import_bound("ortools.sat.python.cp_model")?
+            .getattr("CpSolver")?
+            .call0()?;
+        let parameters = solver.getattr("parameters")?;
+        // parameters.setattr("max_presolve_iterations", 30)?;
+        parameters.setattr("max_memory_in_mb", max_memory_in_mb)?;
+        parameters.setattr("log_search_progress", true)?;
+        // parameters.setattr("max_time_in_seconds", 60.0 * 10.0)?;
+        // parameters.setattr("debug_crash_on_bad_hint", true)?;
+
+        let mut objective_lower_bound = 0;
+        let mut objective_upper_bound = self.symbols.len();
+        let mut best_solution_permutations = HashMap::new();
+        let mut best_solution_var_values = Vec::new();
+        for iter_num in 1.. {
+            let hint_type = match iter_num {
+                1 => HintType::Original,
+                ..=40 => HintType::Random,
+                _ => HintType::None,
+            };
+            println!("\x1b[96m====== Iteration {iter_num} (hint_type={hint_type:?}) ======\x1b[0m");
+
+            if hint_type == HintType::None {
+                // Generate a complete+feasible hint based on the best set of permutations found so far.
+                // (Not necessary when hinting, because those runs are fast and the hint will potentially be infeasible anyway.)
+                println!("Computing new hint...");
+
+                let (model, vars) = self.to_cp_sat(py, HintType::None)?;
+                for (var, value) in &best_solution_permutations {
+                    model.call_method1("add", (vars[*var].call_method1("__eq__", (*value,))?,))?;
+                }
+
+                let solver = py
+                    .import_bound("ortools.sat.python.cp_model")?
+                    .getattr("CpSolver")?
+                    .call0()?;
+                let parameters = solver.getattr("parameters")?;
+                parameters.setattr("max_memory_in_mb", max_memory_in_mb)?;
+
+                let _status = solver.call_method1("solve", (&model,))?;
+                assert!(solver.call_method0("status_name")?.extract::<String>()? == "OPTIMAL");
+                let solution = self.extract_solution(&solver, &vars)?;
+
+                best_solution_var_values = vars
+                    .map
+                    .iter()
+                    .map(|var| {
+                        solver
+                            .call_method1("value", (var,))
+                            .and_then(|v| v.extract::<i64>())
+                    })
+                    .collect::<PyResult<_>>()?;
+                for (is_css, css_lit) in
+                    iter::zip(&solution.copy_span_starts, &self.copy_span_starts)
+                {
+                    if *is_css {
+                        if let BoolLiteral::Var { id, negated } = *css_lit {
+                            assert!(best_solution_var_values[id] == (!negated) as _);
+                        }
+                    }
+                }
+
+                println!("Updated solution hint based on the best set of permutations so far.");
+            }
+
+            // Get a solution from CP-SAT.
+
+            let (model, vars) = self.to_cp_sat(py, hint_type)?;
+            for (i, value) in best_solution_var_values.iter().enumerate() {
+                model.call_method1("add_hint", (&vars[i], *value))?;
+            }
 
             let _status = solver.call_method1("solve", (&model,))?;
             println!("Status: {}", solver.call_method0("status_name")?);
 
             let mut solution = self.extract_solution(&solver, &vars)?;
             solution.print(&self.symbols);
+            if hint_type == HintType::None {
+                // The lower bound is only valid if no additional ordering constraints were imposed.
+                objective_lower_bound = objective_lower_bound.max(solution.objective_value());
+            }
 
-            let mut total_new_literals = 0;
+            // Check if the solution is feasible.
+            // If not, add lazy constraints that eliminate bad solutions like this from the feasible set
+            // (while retaining at least one optimal solution).
+
+            let mut num_infeasible_css_flags = 0;
             let mut cur_span_end = 0;
             for (i, &id) in solution.symbol_sequence.iter().enumerate() {
                 let is_css = &mut solution.copy_span_starts[id];
@@ -614,42 +713,100 @@ impl Model {
                     //  - this symbol must start a new span, OR
                     //  - the symbol sequence needs to be different
 
-                    // If there is not any "parallel copy quadrilateral", then is_css must be true.
-                    let symbol = &self.symbols[id];
-                    let mut is_any_parallel_copy_possible = Disjunction::Const(false);
-                    for (&prev_id, &edge_flag) in &symbol.incoming_arcs {
-                        let prev_symbol = &self.symbols[prev_id];
-
-                        for (&copy_id, &can_copy) in &symbol.copy_conditions {
-                            for (&prev_copy_id, &prev_can_copy) in &prev_symbol.copy_conditions {
-                                let prev_copy_symbol = &self.symbols[prev_copy_id];
-
-                                if let Some(&edge_flag2) =
-                                    prev_copy_symbol.outgoing_arcs.get(&copy_id)
-                                {
-                                    let is_parallel_copy_possible = edge_flag
-                                        & edge_flag2
-                                        & self.vars.literal(can_copy)
-                                        & self.vars.literal(prev_can_copy);
-
-                                    // println!(
-                                    //     "  {:?} possible = {is_parallel_copy_possible:?}",
-                                    //     char::from(symbol.label)
-                                    // );
-                                    is_any_parallel_copy_possible |=
-                                        self.vars.literal(is_parallel_copy_possible);
-                                    total_new_literals += 1;
-                                }
+                    // Find the shortest substring that ends at this symbol and is NOT present earlier in the sequence.
+                    let is_present_before = |start: usize, len: usize| {
+                        for start2 in 0..start {
+                            let labels1 = (start..start + len)
+                                .map(|i| self.symbols[solution.symbol_sequence[i]].label);
+                            let labels2 = (start2..start2 + len)
+                                .map(|i| self.symbols[solution.symbol_sequence[i]].label);
+                            if labels1.zip(labels2).all(|(l1, l2)| l1 == l2) {
+                                return true;
                             }
                         }
-                    }
+                        false
+                    };
+                    let bad_span_start = (1..)
+                        .map(|len| i + 1 - len)
+                        .find(|&start| !is_present_before(start, i - start + 1))
+                        .unwrap();
+                    let bad_span_ids = &solution.symbol_sequence[bad_span_start..=i];
 
-                    // println!(
-                    //     "  {:?}   any possible = {is_any_parallel_copy_possible:?}",
-                    //     char::from(symbol.label)
-                    // );
-                    self.vars
-                        .add_implication(!is_any_parallel_copy_possible, self.copy_span_starts[id]);
+                    // Get a boolean expression representing whether the symbols in this span are contiguous.
+                    let is_bad_span_contiguous = Conjunction::from_iter(
+                        iter::zip(bad_span_ids, &bad_span_ids[1..])
+                            .map(|(id1, id2)| self.symbols[*id1].outgoing_arcs[id2]),
+                    );
+
+                    // Get a boolean expression representing whether this span is present earlier in the sequence.
+                    fn is_match_present(
+                        symbols: &[Symbol],
+                        vars: &mut VariableRegistry,
+                        span_ids: &[usize],
+                        search_start_id: usize,
+                        condition: Conjunction,
+                    ) -> Disjunction {
+                        assert!(symbols[search_start_id].label == symbols[span_ids[0]].label);
+                        assert!(!span_ids.is_empty());
+                        if span_ids.len() == 1 {
+                            return vars.literal(condition).into();
+                        }
+
+                        let next_label = symbols[span_ids[1]].label;
+
+                        Disjunction::from_iter(
+                            symbols[search_start_id]
+                                .outgoing_arcs
+                                .iter()
+                                .filter(|(successor_id, _)| {
+                                    symbols[**successor_id].label == next_label
+                                })
+                                .map(|(successor_id, edge_flag)| {
+                                    is_match_present(
+                                        symbols,
+                                        vars,
+                                        &span_ids[1..],
+                                        *successor_id,
+                                        condition.clone() & *edge_flag,
+                                    )
+                                }),
+                        )
+                    }
+                    let is_bad_span_present_earlier = Disjunction::from_iter(
+                        self.symbols[bad_span_ids[0]].copy_conditions.iter().map(
+                            |(&copy_id, &is_before)| {
+                                let is_before = self.vars.literal(is_before).into();
+                                is_match_present(
+                                    &self.symbols,
+                                    &mut self.vars,
+                                    bad_span_ids,
+                                    copy_id,
+                                    is_before,
+                                )
+                            },
+                        ),
+                    );
+
+                    // Add:  (is_bad_span_contiguous & !is_bad_span_present_earlier) => #CSS(bad_span[1:]) >= 1    (if bad_span.len() > 1)
+                    //                                                                  #CSS(bad_span) >= 1        (if bad_span.len() == 1)
+                    let enforcement_condition =
+                        is_bad_span_contiguous & !is_bad_span_present_earlier;
+                    if bad_span_ids.len() == 1 {
+                        self.vars.add_implication(
+                            enforcement_condition,
+                            self.copy_span_starts[bad_span_ids[0]],
+                        );
+                    } else {
+                        self.vars.add_at_least_one_if(
+                            bad_span_ids[1..]
+                                .iter()
+                                .map(|&id| self.copy_span_starts[id]),
+                            enforcement_condition,
+                        );
+                    }
+                    num_infeasible_css_flags += 1;
+
+                    // Patch the infeasibility in this solution by starting a new span.
                     *is_css = true;
                 }
 
@@ -675,9 +832,44 @@ impl Model {
                 }
             }
 
-            println!("Added {total_new_literals} new literals.");
+            if num_infeasible_css_flags == 0 {
+                println!("\x1b[96mNo infeasible CSS flags found.\x1b[0m");
+            } else {
+                println!(
+                    "\x1b[96mAdded constraints to fix {num_infeasible_css_flags} infeasible CSS flag(s).\x1b[0m"
+                );
+            }
+            if solution.objective_value() < objective_upper_bound {
+                // This is a new-best completely feasible solution.
+                // Update the upper bound.
+                objective_upper_bound = solution.objective_value();
+
+                // Extract the permutations from this solution.
+                best_solution_permutations = HashMap::new();
+                for index_set in &self.permutation_index_sets {
+                    for var in index_set.clone() {
+                        let value = solver
+                            .call_method1("value", (&vars[var],))?
+                            .extract::<i64>()?;
+                        best_solution_permutations.insert(var, value);
+                    }
+                }
+            }
+
+            if objective_lower_bound == objective_upper_bound {
+                println!();
+                println!("Objective optimized!");
+                println!("    Optimal objective value: {}", objective_upper_bound);
+                break;
+            }
+
             solution.print(&self.symbols);
 
+            println!(
+                "Optimal objective value is in [{objective_lower_bound}, {objective_upper_bound}]"
+            );
+
+            println!();
             println!();
         }
 

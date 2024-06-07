@@ -44,17 +44,14 @@ pub enum Conjunction {
     Vars(HashMap<usize, bool>),
 }
 
-impl Not for Conjunction {
-    type Output = Disjunction;
-
-    fn not(self) -> Disjunction {
+impl Conjunction {
+    pub fn literals(&self) -> Vec<BoolLiteral> {
         match self {
-            Conjunction::Const(value) => Disjunction::Const(!value),
-            Conjunction::Vars(vars) => Disjunction::Vars(
-                vars.into_iter()
-                    .map(|(id, negated)| (id, !negated))
-                    .collect(),
-            ),
+            Conjunction::Const(value) => vec![BoolLiteral::Const(*value)],
+            Conjunction::Vars(vars) => vars
+                .iter()
+                .map(|(&id, &negated)| BoolLiteral::Var { id, negated })
+                .collect(),
         }
     }
 }
@@ -66,6 +63,28 @@ impl From<BoolLiteral> for Conjunction {
             BoolLiteral::Var { id, negated } => {
                 Conjunction::Vars(HashMap::from_iter([(id, negated)]))
             }
+        }
+    }
+}
+
+impl<T: Into<Conjunction>> FromIterator<T> for Conjunction {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        iter.into_iter()
+            .fold(Conjunction::Const(true), |accum, item| accum & item.into())
+    }
+}
+
+impl Not for Conjunction {
+    type Output = Disjunction;
+
+    fn not(self) -> Disjunction {
+        match self {
+            Conjunction::Const(value) => Disjunction::Const(!value),
+            Conjunction::Vars(vars) => Disjunction::Vars(
+                vars.into_iter()
+                    .map(|(id, negated)| (id, !negated))
+                    .collect(),
+            ),
         }
     }
 }
@@ -131,17 +150,14 @@ pub enum Disjunction {
     Vars(HashMap<usize, bool>),
 }
 
-impl Not for Disjunction {
-    type Output = Conjunction;
-
-    fn not(self) -> Conjunction {
+impl Disjunction {
+    pub fn into_literals(self) -> Vec<BoolLiteral> {
         match self {
-            Disjunction::Const(value) => Conjunction::Const(!value),
-            Disjunction::Vars(vars) => Conjunction::Vars(
-                vars.into_iter()
-                    .map(|(id, negated)| (id, !negated))
-                    .collect(),
-            ),
+            Disjunction::Const(value) => vec![BoolLiteral::Const(value)],
+            Disjunction::Vars(vars) => vars
+                .into_iter()
+                .map(|(id, negated)| BoolLiteral::Var { id, negated })
+                .collect(),
         }
     }
 }
@@ -153,6 +169,28 @@ impl From<BoolLiteral> for Disjunction {
             BoolLiteral::Var { id, negated } => {
                 Disjunction::Vars(HashMap::from_iter([(id, negated)]))
             }
+        }
+    }
+}
+
+impl<T: Into<Disjunction>> FromIterator<T> for Disjunction {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        iter.into_iter()
+            .fold(Disjunction::Const(false), |accum, item| accum | item.into())
+    }
+}
+
+impl Not for Disjunction {
+    type Output = Conjunction;
+
+    fn not(self) -> Conjunction {
+        match self {
+            Disjunction::Const(value) => Conjunction::Const(!value),
+            Disjunction::Vars(vars) => Conjunction::Vars(
+                vars.into_iter()
+                    .map(|(id, negated)| (id, !negated))
+                    .collect(),
+            ),
         }
     }
 }
