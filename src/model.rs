@@ -3,12 +3,12 @@
 use std::{
     borrow::Borrow,
     cmp::Ordering,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     iter,
     ops::{Index, Range, RangeInclusive},
 };
 
-use pyo3::{prelude::*, py_run};
+use pyo3::prelude::*;
 
 use crate::{
     bool_literal::{BoolLiteral, Conjunction, Disjunction},
@@ -27,70 +27,116 @@ pub struct Symbol {
     index: Vec<IntValue>,
     outgoing_arcs: HashMap<usize, BoolLiteral>,
     incoming_arcs: HashMap<usize, BoolLiteral>,
-    copy_flags: HashMap<usize, (BoolLiteral, BeforeCondition)>,
+    copy_conditions: HashMap<usize, BeforeCondition>,
 }
 
 #[derive(Default)]
 struct VariableRegistry {
     ranges: Vec<RangeInclusive<i64>>,
-    conjunction_vars: Vec<(usize, HashMap<usize, bool>)>,
-    disjunctions: Vec<HashMap<usize, bool>>,
+    conjunction_vars: HashMap<BTreeMap<usize, bool>, usize>,
+    disjunctions: HashSet<BTreeMap<usize, bool>>,
+    is_less_literals: HashMap<(usize, usize), BoolLiteral>, // (id1, id2) => is_less  means  is_less = (id1 < id2)
 }
 
-impl VariableRegistry {
-    fn new_bool(&mut self) -> usize {
-        self.ranges.push(0..=1);
-        self.ranges.len() - 1
+mod variable_registry_impl {
+    use super::*;
+
+    pub(super) trait IntoLiteral {
+        fn into_literal(self, var_reg: &mut VariableRegistry) -> BoolLiteral;
     }
 
-    fn new_bool_literal(&mut self) -> BoolLiteral {
-        BoolLiteral::Var {
-            id: self.new_bool(),
-            negated: false,
+    impl<T: Into<BoolLiteral>> IntoLiteral for T {
+        fn into_literal(self, _var_reg: &mut VariableRegistry) -> BoolLiteral {
+            self.into()
         }
     }
 
-    #[allow(dead_code)]
-    fn new_int(&mut self, min: i64, max: i64) -> usize {
-        assert!(min <= max);
-        self.ranges.push(min..=max);
-        self.ranges.len() - 1
-    }
-
-    fn new_ints(&mut self, min: i64, max: i64, num_vars: usize) -> Range<usize> {
-        assert!(min <= max);
-        let start = self.ranges.len();
-        self.ranges.extend(iter::repeat(min..=max).take(num_vars));
-        start..self.ranges.len()
-    }
-
-    fn literal(&mut self, conjunction: Conjunction) -> BoolLiteral {
-        match conjunction {
-            Conjunction::Const(value) => BoolLiteral::Const(value),
-            Conjunction::Vars(vars) => {
-                if vars.is_empty() {
-                    BoolLiteral::Const(true)
-                } else if vars.len() == 1 {
-                    let (id, negated) = vars.into_iter().next().unwrap();
-                    BoolLiteral::Var { id, negated }
-                } else {
-                    let id = self.new_bool();
-                    self.conjunction_vars.push((id, vars));
-                    BoolLiteral::Var { id, negated: false }
+    impl IntoLiteral for Conjunction {
+        fn into_literal(self, var_reg: &mut VariableRegistry) -> BoolLiteral {
+            match self {
+                Conjunction::Const(value) => BoolLiteral::Const(value),
+                Conjunction::Vars(vars) => {
+                    if vars.is_empty() {
+                        BoolLiteral::Const(true)
+                    } else if vars.len() == 1 {
+                        let (id, negated) = vars.into_iter().next().unwrap();
+                        BoolLiteral::Var { id, negated }
+                    } else {
+                        let id = *var_reg
+                            .conjunction_vars
+                            .entry(BTreeMap::from_iter(vars))
+                            .or_insert_with(|| new_bool(&mut var_reg.ranges));
+                        BoolLiteral::Var { id, negated: false }
+                    }
                 }
             }
         }
     }
 
-    fn add_implication(
-        &mut self,
-        antecedent: impl Into<Conjunction>,
-        consequent: impl Into<Disjunction>,
-    ) {
-        match !antecedent.into() | consequent.into() {
-            Disjunction::Const(true) => {}
-            Disjunction::Const(false) => panic!("add_implication: statically infeasible"),
-            Disjunction::Vars(vars) => self.disjunctions.push(vars),
+    impl IntoLiteral for BeforeCondition {
+        fn into_literal(self, var_reg: &mut VariableRegistry) -> BoolLiteral {
+            match self {
+                BeforeCondition::Never => BoolLiteral::Const(false),
+                BeforeCondition::Always => BoolLiteral::Const(true),
+                BeforeCondition::IfLess(id1, id2) => *var_reg
+                    .is_less_literals
+                    .entry((id1, id2))
+                    .or_insert_with(|| new_bool_literal(&mut var_reg.ranges)),
+            }
+        }
+    }
+
+    fn new_bool(ranges: &mut Vec<RangeInclusive<i64>>) -> usize {
+        ranges.push(0..=1);
+        ranges.len() - 1
+    }
+
+    fn new_bool_literal(ranges: &mut Vec<RangeInclusive<i64>>) -> BoolLiteral {
+        BoolLiteral::Var {
+            id: new_bool(ranges),
+            negated: false,
+        }
+    }
+
+    impl VariableRegistry {
+        pub(super) fn new_bool(&mut self) -> usize {
+            new_bool(&mut self.ranges)
+        }
+
+        pub(super) fn new_bool_literal(&mut self) -> BoolLiteral {
+            new_bool_literal(&mut self.ranges)
+        }
+
+        #[allow(dead_code)]
+        pub(super) fn new_int(&mut self, min: i64, max: i64) -> usize {
+            assert!(min <= max);
+            self.ranges.push(min..=max);
+            self.ranges.len() - 1
+        }
+
+        pub(super) fn new_ints(&mut self, min: i64, max: i64, num_vars: usize) -> Range<usize> {
+            assert!(min <= max);
+            let start = self.ranges.len();
+            self.ranges.extend(iter::repeat(min..=max).take(num_vars));
+            start..self.ranges.len()
+        }
+
+        pub(super) fn literal(&mut self, value: impl IntoLiteral) -> BoolLiteral {
+            value.into_literal(self)
+        }
+
+        pub(super) fn add_implication(
+            &mut self,
+            antecedent: impl Into<Conjunction>,
+            consequent: impl Into<Disjunction>,
+        ) {
+            match !antecedent.into() | consequent.into() {
+                Disjunction::Const(true) => {}
+                Disjunction::Const(false) => panic!("add_implication: statically infeasible"),
+                Disjunction::Vars(vars) => {
+                    self.disjunctions.insert(BTreeMap::from_iter(vars));
+                }
+            }
         }
     }
 }
@@ -123,7 +169,9 @@ impl Model {
         let (start_arcs, _) = model.create_symbols(&string_set, &[]);
         model.start_arcs = HashMap::from_iter(start_arcs);
         model.create_copy_flags();
-        model.create_copy_span_starts();
+        model.copy_span_starts = iter::repeat_with(|| model.vars.new_bool_literal())
+            .take(model.symbols.len())
+            .collect();
         model
     }
 
@@ -134,7 +182,7 @@ impl Model {
             index,
             outgoing_arcs: HashMap::new(),
             incoming_arcs: HashMap::new(),
-            copy_flags: HashMap::new(),
+            copy_conditions: HashMap::new(),
         });
         self.symbols_by_label
             .entry(label)
@@ -337,115 +385,15 @@ impl Model {
             for &id2 in &self.symbols_by_label[&self.symbols[id].label] {
                 let is_before_condition = self.is_before(id2, id);
                 if is_before_condition != BeforeCondition::Never {
-                    let flag = self.vars.new_bool_literal();
                     total_num_flags += 1;
                     self.symbols[id]
-                        .copy_flags
-                        .insert(id2, (flag, is_before_condition));
+                        .copy_conditions
+                        .insert(id2, is_before_condition);
                 }
             }
         }
 
         println!("Created {total_num_flags} copy flags.");
-    }
-
-    fn create_copy_span_starts(&mut self) {
-        let mut total_num_literals = 0;
-
-        for id in 0..self.symbols.len() {
-            let symbol = &self.symbols[id];
-
-            // is_css = true iff there is not any "parallel copy quadrilateral".
-            let mut is_css = Conjunction::Const(true);
-            for (&prev_id, &edge_flag) in &symbol.incoming_arcs {
-                let prev_symbol = &self.symbols[prev_id];
-
-                for (&id2, &(copy_flag, _)) in &symbol.copy_flags {
-                    for (&prev_id2, &(prev_copy_flag, _)) in &prev_symbol.copy_flags {
-                        let prev_symbol2 = &self.symbols[prev_id2];
-
-                        if let Some(&edge_flag2) = prev_symbol2.outgoing_arcs.get(&id2) {
-                            let parallel_copy = edge_flag & edge_flag2 & copy_flag & prev_copy_flag;
-
-                            // Reduce the number of optimal solutions (while preserving the optimal value):
-                            // If a parallel copy is possible, then mandate it.
-                            self.vars.add_implication(
-                                edge_flag & edge_flag2 & prev_copy_flag,
-                                copy_flag,
-                            );
-
-                            is_css &= !self.vars.literal(parallel_copy);
-                            total_num_literals += 1;
-                        }
-                    }
-                }
-            }
-
-            let is_css = self.vars.literal(is_css);
-            self.copy_span_starts.push(is_css);
-
-            let match_bounds = symbol
-                .copy_flags
-                .iter()
-                .map(|(id2, &(copy_flag, is_before))| {
-                    let mut id1 = id;
-                    let mut id2 = *id2;
-                    let mut min_len: usize = 1;
-                    let mut max_len = usize::MAX;
-                    loop {
-                        let arcs1 = &self.symbols[id1].outgoing_arcs;
-                        let arcs2 = &self.symbols[id2].outgoing_arcs;
-                        if arcs1.len() == 1 && arcs2.len() == 1 {
-                            id1 = *arcs1.keys().next().unwrap();
-                            id2 = *arcs2.keys().next().unwrap();
-                            if self.symbols[id1].label == self.symbols[id2].label {
-                                min_len += 1;
-                                continue;
-                            } else {
-                                max_len = min_len;
-                                break;
-                            }
-                        }
-                        break;
-                    }
-
-                    (copy_flag, is_before, min_len, max_len)
-                })
-                .collect::<Vec<_>>();
-
-            if let Some(max_guaranteed_min_len) = match_bounds
-                .iter()
-                .filter(|(_, is_before, _, _)| *is_before == BeforeCondition::Always)
-                .map(|(_, _, min_len, _)| *min_len)
-                .max()
-            {
-                let len_upper_bound = match_bounds
-                    .iter()
-                    .map(|(_, _, _, max_len)| *max_len)
-                    .max()
-                    .unwrap();
-
-                let mut good_flags = Disjunction::Const(false);
-                if let Some((copy_flag, _, _, _)) =
-                    match_bounds.iter().find(|(_, is_before, min_len, _)| {
-                        *is_before == BeforeCondition::Always && *min_len == len_upper_bound
-                    })
-                {
-                    // We found a copy target that is guaranteed to obtain the maximum possible
-                    // match length, so we can mandate that this specific token be copied (if is_css).
-                    good_flags |= *copy_flag;
-                } else {
-                    for (copy_flag, _, _, max_len) in match_bounds {
-                        if max_len >= max_guaranteed_min_len {
-                            good_flags |= copy_flag;
-                        }
-                    }
-                }
-                self.vars.add_implication(is_css, good_flags);
-            }
-        }
-
-        println!("Created copy span start flags. ({total_num_literals} literals)");
     }
 }
 
@@ -486,10 +434,30 @@ impl<'py> VarMap<'py> {
             .map(|l| self.literal(*l.borrow()))
             .collect()
     }
+
+    fn literal_value(&self, solver: &Bound<'py, PyAny>, literal: BoolLiteral) -> PyResult<bool> {
+        let value = solver.call_method1("value", (&self.literal(literal)?,))?;
+        Ok(match value.extract::<i64>()? {
+            0 => false,
+            1 => true,
+            _ => panic!("unexpected boolean literal value: {}", value),
+        })
+    }
+
+    fn literal_values(
+        &self,
+        solver: &Bound<'py, PyAny>,
+        literals: impl IntoIterator<Item = impl Borrow<BoolLiteral>>,
+    ) -> PyResult<Vec<bool>> {
+        literals
+            .into_iter()
+            .map(|l| self.literal_value(solver, *l.borrow()))
+            .collect()
+    }
 }
 
 impl Model {
-    pub fn to_cp_sat<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn to_cp_sat<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyAny>, VarMap<'py>)> {
         // Create the model object.
         let model = py
             .import_bound("ortools.sat.python.cp_model")?
@@ -544,30 +512,8 @@ impl Model {
                 .call_method1("only_enforce_if", (vars.literal(!is_eq)?,))?;
         }
 
-        // Create the copy flag is_before and at_most_one constraints.
-        for symbol in &self.symbols {
-            for &(copy_flag, is_before) in symbol.copy_flags.values() {
-                let is_before = match is_before {
-                    BeforeCondition::Never => unreachable!(),
-                    BeforeCondition::Always => continue,
-                    BeforeCondition::IfLess(id1, id2) => {
-                        vars[id1].call_method1("__lt__", (&vars[id2],))?
-                    }
-                };
-                let copy_flag = vars.literal(copy_flag)?;
-                model
-                    .call_method1("add", (is_before,))?
-                    .call_method1("only_enforce_if", (copy_flag,))?;
-            }
-
-            model.call_method1(
-                "add_at_most_one",
-                (vars.literals(symbol.copy_flags.values().map(|&(copy_flag, _)| copy_flag))?,),
-            )?;
-        }
-
         // Create the conjunction literal constraints.
-        for (id, literals) in &self.vars.conjunction_vars {
+        for (literals, id) in &self.vars.conjunction_vars {
             let literals = literals
                 .iter()
                 .map(|(&id, &negated)| BoolLiteral::Var { id, negated });
@@ -582,53 +528,172 @@ impl Model {
             model.call_method1("add_bool_or", (vars.literals(literals)?,))?;
         }
 
-        let csss = vars.literals(&self.copy_span_starts)?;
+        // Create the "is less" indicator constraints.
+        for ((id1, id2), is_less) in &self.vars.is_less_literals {
+            let v1 = &vars[*id1];
+            let v2 = &vars[*id2];
+            model
+                .call_method1("add", (v1.call_method1("__lt__", (v2,))?,))?
+                .call_method1("only_enforce_if", (vars.literal(*is_less)?,))?;
+            model
+                .call_method1("add", (v1.call_method1("__ge__", (v2,))?,))?
+                .call_method1("only_enforce_if", (vars.literal(!*is_less)?,))?;
+        }
 
-        py_run!(
-            py,
-            model csss,
-            r#"
-print()
-print()
-print()
-from ortools.sat.python import cp_model
+        let mut objective = 0i64.into_py(py).into_bound(py);
+        for is_css in vars.literals(&self.copy_span_starts)? {
+            objective = objective.add(is_css)?;
+        }
+        model.call_method1("minimize", (objective,))?;
 
-model.minimize(sum(csss))
+        Ok((model, vars))
+    }
+}
 
-# Solve
-global solver
-solver = cp_model.CpSolver()
-#print(solver.parameters.max_presolve_iterations); quit()
-#solver.parameters.max_presolve_iterations = 30
-solver.parameters.max_memory_in_mb = 1_000 // 2
-solver.parameters.log_search_progress = True
-# solver.parameters.max_time_in_seconds = 60.0 * 10
-# solver.parameters.debug_crash_on_bad_hint = True
+struct Solution {
+    symbol_sequence: Vec<usize>,
+    copy_span_starts: Vec<bool>,
+}
 
-print("Solving...")
-status = solver.solve(model)
-print("Status:", solver.status_name())
-            "#
-        );
+impl Solution {
+    fn objective_value(&self) -> usize {
+        self.copy_span_starts.iter().filter(|&&b| b).count()
+    }
 
-        let solver = py.eval_bound("solver", None, None)?;
-        // let get_value = |var_id: usize| -> PyResult<i64> {
-        //     let value = solver.call_method1("value", (&vars[var_id],))?;
-        //     value.extract()
-        // };
-        let get_literal_value = |literal: BoolLiteral| -> PyResult<bool> {
-            let value = solver.call_method1("value", (&vars.literal(literal)?,))?;
-            Ok(match value.extract::<i64>()? {
-                0 => false,
-                1 => true,
-                _ => panic!("unexpected boolean literal value: {}", value),
-            })
-        };
+    fn print(&self, symbols: &[Symbol]) {
+        println!("Objective value: {}", self.objective_value());
+
+        let mut highlighted = true;
+        for &id in &self.symbol_sequence {
+            highlighted = self.copy_span_starts[id];
+            if highlighted {
+                print!("\x1b[38;5;198m\x1b[48;5;52m");
+            } else {
+                print!("\x1b[0m");
+            }
+            print!("{}", char::from(symbols[id].label));
+        }
+        if highlighted {
+            print!("\x1b[0m");
+        }
+        println!();
+    }
+}
+
+impl Model {
+    pub fn solve<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        println!();
+
+        for iter_num in 1..=10 {
+            println!("====== Iteration {} ======", iter_num);
+            let (model, vars) = self.to_cp_sat(py)?;
+
+            let solver = py
+                .import_bound("ortools.sat.python.cp_model")?
+                .getattr("CpSolver")?
+                .call0()?;
+            let parameters = solver.getattr("parameters")?;
+            // parameters.setattr("max_presolve_iterations", 30)?;
+            parameters.setattr("max_memory_in_mb", 1_000 / 2)?;
+            // parameters.setattr("log_search_progress", true)?;
+            // parameters.setattr("max_time_in_seconds", 60.0 * 10.0)?;
+            // parameters.setattr("debug_crash_on_bad_hint", true)?;
+
+            let _status = solver.call_method1("solve", (&model,))?;
+            println!("Status: {}", solver.call_method0("status_name")?);
+
+            let mut solution = self.extract_solution(&solver, &vars)?;
+            solution.print(&self.symbols);
+
+            let mut total_new_literals = 0;
+            let mut cur_span_end = 0;
+            for (i, &id) in solution.symbol_sequence.iter().enumerate() {
+                let is_css = &mut solution.copy_span_starts[id];
+                if !*is_css && (i == 0 || i > cur_span_end) {
+                    // This symbol is past the end of the span, so either:
+                    //  - this symbol must start a new span, OR
+                    //  - the symbol sequence needs to be different
+
+                    // If there is not any "parallel copy quadrilateral", then is_css must be true.
+                    let symbol = &self.symbols[id];
+                    let mut is_any_parallel_copy_possible = Disjunction::Const(false);
+                    for (&prev_id, &edge_flag) in &symbol.incoming_arcs {
+                        let prev_symbol = &self.symbols[prev_id];
+
+                        for (&copy_id, &can_copy) in &symbol.copy_conditions {
+                            for (&prev_copy_id, &prev_can_copy) in &prev_symbol.copy_conditions {
+                                let prev_copy_symbol = &self.symbols[prev_copy_id];
+
+                                if let Some(&edge_flag2) =
+                                    prev_copy_symbol.outgoing_arcs.get(&copy_id)
+                                {
+                                    let is_parallel_copy_possible = edge_flag
+                                        & edge_flag2
+                                        & self.vars.literal(can_copy)
+                                        & self.vars.literal(prev_can_copy);
+
+                                    // println!(
+                                    //     "  {:?} possible = {is_parallel_copy_possible:?}",
+                                    //     char::from(symbol.label)
+                                    // );
+                                    is_any_parallel_copy_possible |=
+                                        self.vars.literal(is_parallel_copy_possible);
+                                    total_new_literals += 1;
+                                }
+                            }
+                        }
+                    }
+
+                    // println!(
+                    //     "  {:?}   any possible = {is_any_parallel_copy_possible:?}",
+                    //     char::from(symbol.label)
+                    // );
+                    self.vars
+                        .add_implication(!is_any_parallel_copy_possible, self.copy_span_starts[id]);
+                    *is_css = true;
+                }
+
+                if *is_css {
+                    // Determine the maximum extent of the span starting at this symbol.
+                    let max_match_len = (0..i)
+                        .map(|mut j| {
+                            let mut i2 = i;
+                            while i2 < solution.symbol_sequence.len()
+                                && self.symbols[solution.symbol_sequence[i2]].label
+                                    == self.symbols[solution.symbol_sequence[j]].label
+                            {
+                                i2 += 1;
+                                j += 1;
+                            }
+                            i2 - i
+                        })
+                        .max()
+                        .unwrap_or(1)
+                        .max(1);
+                    cur_span_end = i + max_match_len - 1;
+                    // println!("{max_match_len}  =>  {i}-{cur_span_end}");
+                }
+            }
+
+            println!("Added {total_new_literals} new literals.");
+            solution.print(&self.symbols);
+
+            println!();
+        }
+
+        Ok(py.None().into_bound(py))
+    }
+
+    fn extract_solution<'py>(
+        &self,
+        solver: &Bound<'py, PyAny>,
+        vars: &VarMap<'py>,
+    ) -> PyResult<Solution> {
         let get_successor = |outgoing_arcs: &HashMap<usize, BoolLiteral>, id: Option<usize>| {
             let successors: Vec<usize> = outgoing_arcs
                 .iter()
                 .filter_map(|(&id, &cond)| {
-                    get_literal_value(cond)
+                    vars.literal_value(solver, cond)
                         .map(|cond| cond.then_some(id))
                         .transpose()
                 })
@@ -652,30 +717,18 @@ print("Status:", solver.status_name())
             }
         };
 
-        let mut output_ids = Vec::new();
+        let mut symbol_sequence = Vec::new();
         let mut next_id = get_successor(&self.start_arcs, None)?;
         assert!(next_id.is_some());
         while let Some(id) = next_id {
-            output_ids.push(id);
+            symbol_sequence.push(id);
             next_id = get_successor(&self.symbols[id].outgoing_arcs, Some(id))?;
         }
 
-        let mut highlighted = true;
-        for id in output_ids {
-            highlighted = get_literal_value(self.copy_span_starts[id])?;
-            if highlighted {
-                print!("\x1b[38;5;198m\x1b[48;5;52m");
-            } else {
-                print!("\x1b[0m");
-            }
-            print!("{}", char::from(self.symbols[id].label));
-        }
-        if highlighted {
-            print!("\x1b[0m");
-        }
-        println!();
-
-        // Ok(model)
-        Ok(py.None().into_bound(py))
+        let copy_span_starts = vars.literal_values(solver, &self.copy_span_starts)?;
+        Ok(Solution {
+            symbol_sequence,
+            copy_span_starts,
+        })
     }
 }
